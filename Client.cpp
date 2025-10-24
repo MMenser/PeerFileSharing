@@ -8,7 +8,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <signal.h>
+#include <poll.h>
 
 using namespace std;
 
@@ -117,7 +117,7 @@ int connectToSocket(const char* ip, string port = "3490") {
     }
     
     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
-    cout << "client: connecting to " << sockfd << endl;
+    cout << "client: connected to " << s << endl;
     freeaddrinfo(servinfo);
     
     return sockfd; 
@@ -162,123 +162,228 @@ void acceptPeerConnection() {
     closeServerConnection();
 }
 
-void receiveMessages(int sockfd) {
-    int numbytes;
-    char buf[256];
-    while ((numbytes = recv(sockfd, buf, sizeof buf - 1, 0)) > 0) {
-        buf[numbytes] = '\0';
-        string message = string(buf);
-
-        // Handle connection request (y/n prompt from server)
-        if (message.find("Connection request from") != string::npos) {
-            cout << message << flush;
-            // User will manually type /accept <username> or /decline <username>
-        }
-        // Handle /makeconnection command from server (after accepting)
-        else if (message.substr(0, 15) == "/makeconnection") {
-            string peerIP = message.substr(16);
-            // Remove newline if present
-            if (!peerIP.empty() && peerIP.back() == '\n') {
-                peerIP.pop_back();
-            }
-            
-            cout << "Connecting to peer at " << peerIP << endl;
-            closeServerConnection();
-            
-            peerSockFD = connectToSocket(peerIP.c_str(), "4000");
-            if (peerSockFD != -1) {
-                if (send(peerSockFD, "hello", 5, 0) == -1) {
-                    perror("send to peer");
-                } else {
-                    cout << "Connected to peer!" << endl;
-                }
-            } else {
-                cerr << "Failed to connect to peer" << endl;
-            }
-        }
-        // Handle "Connection accepted" message (requestor side)
-        else if (message.find("/acceptconnection") != string::npos) {
-            cout << message << flush;
-            // Now accept the incoming peer connection
-            cout << "Accepting incoming peer connection..." << endl;
-            acceptPeerConnection();
-        }
-        // Handle /declined message from server
-        else if (message == "/declined" || message == "/declined\n") {
-            cout << "Connection declined by the peer." << endl;
-            // Close listening socket if it exists
-            if (listeningSockFD != -1) {
-                close(listeningSockFD);
-                listeningSockFD = -1;
-            }
-        }
-        // Handle "Located" message (waiting for peer to accept)
-        else if (message.find("Located") != string::npos && message.find("waiting") != string::npos) {
-            cout << message << flush;
-            // Now we wait for peer to accept, which will trigger acceptPeerConnection
-        }
-        // All other messages from server
-        else {
-            cout << "Server: " << message << flush;
-        }
+void handleServerMessage(const string& message) {
+    if (message.find("wants to connect to you") != string::npos) {
+        cout << message << flush;
     }
-    
-    if (numbytes == 0) {
-        cout << "\nConnection closed" << endl;
-    } else {
-        perror("recv");
-    }
-    exit(0);
-}
-
-void openFork(int sockfd, const string& username, bool isServer) {
-    // BEFORE forking: Handle initial server communication
-    if (isServer) {        
-        // Send username
-        if (send(sockfd, username.c_str(), username.length(), 0) == -1) {
-            perror("send");
-            exit(1);
-        }
-    }
-    
-    // NOW fork after initial setup is complete
-    pid_t pid = fork();
-   
-    if (pid == -1) {
-        perror("fork");
-        exit(1);
-    }
-   
-    if (pid == 0) {
-        // Child process: receive messages
-        receiveMessages(sockfd);
-    } else {
-        // Parent process: send messages
-        cout << "------- Enter messages and send with enter -------" << endl;
-        string line;
-        while (getline(cin, line)) {
-            line += "\n";
-            
-            // Start listening when user wants to connect
-            if (line.substr(0, 8) == "/connect") {
-                listeningSockFD = createListeningSocket("4000");
-                cout << "Listening socket created on port 4000" << endl;
-                if (listeningSockFD == -1) {
-                    cerr << "Failed to create listening socket" << endl;
-                    continue;
-                }
-            }
-            
-            // Send the command to server
-            if (send(sockfd, line.c_str(), line.length(), 0) == -1) {
-                perror("send");
-                break;
-            }
+    else if (message.substr(0, 15) == "/makeconnection") { // Requested side
+        string peerIP = message.substr(16);
+        if (!peerIP.empty() && peerIP.back() == '\n') { // Removes newline
+            peerIP.pop_back();
         }
         
-        cout << "\nclient: closing connection" << endl;
-        close(sockfd);
-        kill(pid, SIGTERM);
+        cout << "Connecting to peer at " << peerIP << endl;
+        closeServerConnection();
+        
+        peerSockFD = connectToSocket(peerIP.c_str(), "4000");
+        if (peerSockFD != -1) {
+            if (send(peerSockFD, "hello", 5, 0) == -1) {
+                perror("send to peer");
+            } else {
+                cout << "Connected to peer!" << endl;
+            }
+        } else {
+            cerr << "Failed to connect to peer" << endl;
+        }
+    }
+    else if (message.find("/acceptconnection") != string::npos) { // Requestor side
+        cout << "Peer accepted! ";
+        // The listening socket will handle the incoming connection in the main poll loop
+    }
+    // Handle /declined message from server
+    else if (message == "/declined" || message == "/declined\n") {
+        cout << "Connection declined by the peer." << endl;
+        // Close listening socket if it exists
+        if (listeningSockFD != -1) {
+            close(listeningSockFD);
+            listeningSockFD = -1;
+        }
+    }
+    // Handle "Located" message (waiting for peer to accept)
+    else if (message.find("Located") != string::npos && message.find("waiting") != string::npos) {
+        cout << message << flush;
+    }
+    // All other messages from server
+    else {
+        cout << "Server: " << message << flush;
+    }
+}
+
+void handlePeerMessage(const string& message) {
+    cout << "Peer: " << message << flush;
+}
+
+void runClient(const string& username) {
+    // Set up poll array
+    struct pollfd fds[4];  // stdin, server, listening socket, peer
+    int nfds = 0;
+    
+    // Add stdin (fd 0)
+    fds[nfds].fd = STDIN_FILENO;
+    fds[nfds].events = POLLIN;
+    nfds++;
+    
+    // Add server socket
+    fds[nfds].fd = serverSockFD;
+    fds[nfds].events = POLLIN;
+    nfds++;
+    
+    // Send username to server
+    if (send(serverSockFD, username.c_str(), username.length(), 0) == -1) {
+        perror("send username");
+        return;
+    }
+    
+    cout << "------- Enter messages and send with enter -------" << endl;
+    
+    string stdinBuffer = "";
+    string serverBuffer = "";
+    string peerBuffer = "";
+    
+    while (true) {
+        // Rebuild poll array dynamically
+        nfds = 0;
+        
+        // stdin
+        fds[nfds].fd = STDIN_FILENO;
+        fds[nfds].events = POLLIN;
+        nfds++;
+        
+        // server socket (if still connected)
+        if (serverSockFD != -1) {
+            fds[nfds].fd = serverSockFD;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+        
+        // listening socket (if active)
+        if (listeningSockFD != -1) {
+            fds[nfds].fd = listeningSockFD;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+        
+        // peer socket (if connected)
+        if (peerSockFD != -1) {
+            fds[nfds].fd = peerSockFD;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+        
+        // Wait for activity
+        int poll_count = poll(fds, nfds, -1);
+        
+        if (poll_count == -1) {
+            perror("poll");
+            break;
+        }
+        
+        // Check which sockets have activity
+        for (int i = 0; i < nfds; i++) {
+            if (!(fds[i].revents & POLLIN)) {
+                continue;
+            }
+            
+            if (fds[i].fd == STDIN_FILENO) { // Handle user input to standard input 
+                char buf[256];
+                int numbytes = read(STDIN_FILENO, buf, sizeof buf - 1);
+                if (numbytes <= 0) {
+                    cout << "Exiting..." << endl;
+                    return;
+                }
+                
+                buf[numbytes] = '\0';
+                stdinBuffer += string(buf);
+                
+                size_t pos;
+                while ((pos = stdinBuffer.find('\n')) != string::npos) {
+                    string line = stdinBuffer.substr(0, pos);
+                    stdinBuffer.erase(0, pos + 1);
+                    
+                    if (line.substr(0, 8) == "/connect") { // Prepare to accept incoming connection 
+                        if (listeningSockFD == -1) {
+                            listeningSockFD = createListeningSocket("4000");
+                            if (listeningSockFD == -1) {
+                                cerr << "Failed to create listening socket" << endl;
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    line += "\n";
+                    if (peerSockFD != -1) { // Connected to peer, send messages there
+                        if (send(peerSockFD, line.c_str(), line.length(), 0) == -1) {
+                            perror("send to peer");
+                            close(peerSockFD);
+                            peerSockFD = -1;
+                        }
+                    } else if (serverSockFD != -1) { // Connceted to server, send messages there
+                        if (send(serverSockFD, line.c_str(), line.length(), 0) == -1) {
+                            perror("send to server");
+                            close(serverSockFD);
+                            serverSockFD = -1;
+                        }
+                    }
+                }
+            }
+            // Handle server socket
+            else if (fds[i].fd == serverSockFD) {
+                char buf[256];
+                int numbytes = recv(serverSockFD, buf, sizeof buf - 1, 0);
+                
+                if (numbytes <= 0) {
+                    if (numbytes == 0) {
+                        cout << "Server disconnected" << endl;
+                    } else {
+                        perror("recv from server");
+                    }
+                    close(serverSockFD);
+                    serverSockFD = -1;
+                    continue;
+                }
+                
+                buf[numbytes] = '\0';
+                serverBuffer += string(buf);
+                
+                // Process complete messages (might not have \n)
+                handleServerMessage(serverBuffer);
+                serverBuffer = "";
+            }
+            // Handle listening socket (new peer connection)
+            else if (fds[i].fd == listeningSockFD) {
+                acceptPeerConnection();
+            }
+            // Handle peer socket
+            else if (fds[i].fd == peerSockFD) {
+                char buf[256];
+                int numbytes = recv(peerSockFD, buf, sizeof buf - 1, 0);
+                
+                if (numbytes <= 0) {
+                    if (numbytes == 0) {
+                        cout << "Peer disconnected" << endl;
+                    } else {
+                        perror("recv from peer");
+                    }
+                    close(peerSockFD);
+                    peerSockFD = -1;
+                    continue;
+                }
+                
+                buf[numbytes] = '\0';
+                peerBuffer += string(buf);
+                
+                // Process complete messages
+                size_t pos;
+                while ((pos = peerBuffer.find('\n')) != string::npos) {
+                    string message = peerBuffer.substr(0, pos);
+                    peerBuffer.erase(0, pos + 1);
+                    
+                    if (!message.empty()) {
+                        handlePeerMessage(message + "\n");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -296,6 +401,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
    
-    openFork(serverSockFD, username, true);
+    runClient(username);
+    
+    // Cleanup
+    if (serverSockFD != -1) close(serverSockFD);
+    if (listeningSockFD != -1) close(listeningSockFD);
+    if (peerSockFD != -1) close(peerSockFD);
+    
     return 0;
 }
