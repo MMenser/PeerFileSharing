@@ -13,3 +13,5 @@ If yes,
     open up socket between Bob and Alice
 If no,
     tell Alice that Bob said no
+
+Connection request is being sent to the requestor instead of requested

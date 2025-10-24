@@ -117,7 +117,7 @@ int connectToSocket(const char* ip, string port = "3490") {
     }
     
     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
-    cout << "client: connecting to " << s << endl;
+    cout << "client: connecting to " << sockfd << endl;
     freeaddrinfo(servinfo);
     
     return sockfd; 

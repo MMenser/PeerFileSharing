@@ -8,21 +8,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <signal.h>
-#include <sys/wait.h>
+#include <poll.h>
+#include <vector>
+#include <map>
 #include "ClientList.cpp"
 
 using namespace std;
 const string PORT = "3490";
 const int BACKLOG = 10;
-
-void sigchld_handler(int s)
-{
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        ;
-    errno = saved_errno;
-}
 
 void *get_in_addr(struct sockaddr *sa)
 {
@@ -38,19 +31,19 @@ class Server
 private:
     int sockfd;
     ClientList &clientList;
-
-    void setupSignalHandler()
-    {
-        struct sigaction sa;
-        sa.sa_handler = sigchld_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = SA_RESTART;
-        if (sigaction(SIGCHLD, &sa, NULL) == -1)
-        {
-            perror("sigaction");
-            exit(1);
-        }
-    }
+    
+    // Poll structures
+    struct pollfd fds[MAX_CLIENTS];
+    int nfds;
+    
+    // Map to track client state (fd -> {username, ip, buffer})
+    struct ClientInfo {
+        string username;
+        string ip;
+        string buffer; // For partial messages
+        bool authenticated; // Has sent username
+    };
+    map<int, ClientInfo> clients;
 
     int createSocket()
     {
@@ -110,89 +103,29 @@ private:
         return sockfd;
     }
 
-    void listenForMessages(int client_fd, const string &client_ip, const string &username) {
-        // Receive messages until client disconnects
-        char buf[256];
-        int numbytes = 0;
-        while ((numbytes = recv(client_fd, buf, sizeof buf - 1, 0)) > 0) {
-            buf[numbytes] = '\0';
-            cout << "server: received '" << buf << "' from " << username << endl;
+    void handleConnectionRequest(string message, string &response, const string username) {
+        string peerUsername = message.substr(9);
+        char* peerIP = clientList.findUserIP(peerUsername);
+        if (peerIP == nullptr) {
+            response = "User " + peerUsername + " not found or not online.\n";
+            return;
         }
-
-        if (numbytes == 0) {
-            cout << "server: user '" << username << "' disconnected" << endl;
+        int peerSockFD = clientList.findUserSockFD(peerUsername);
+        string connectionRequest = username + " wants to connect to you. Accept? (/accept " + username + " or /decline " + username + ")\n";
+        
+        cout << "Sending connection request to " << peerUsername << " at " << string(peerIP) << " sockfd " << peerSockFD << endl;
+        
+        ssize_t bytes_sent = send(peerSockFD, connectionRequest.c_str(), connectionRequest.length(), 0);
+        if (bytes_sent == -1) {
+            perror("send connection request");
+            response = "Failed to send connection request.\n";
         }
         else {
-            perror("recv");
+            response = "Located " + peerUsername + " @" + string(peerIP) + " - waiting for peer to accept connection... \n";
         }
-
-        // Remove client from list
-        clientList.remove(client_fd);
-        close(client_fd);
-        exit(0);
     }
 
-void handleClient(int client_fd, const string& client_ip) {
-        close(sockfd); // child doesn't need listener
-
-        // Receive username
-        char username_buf[50];
-        int numbytes = recv(client_fd, username_buf, sizeof username_buf - 1, 0);
-        if (numbytes <= 0) {
-            close(client_fd);
-            exit(0);
-        }
-        username_buf[numbytes] = '\0';
-        string username(username_buf);
-        
-        // Add client to list
-        clientList.add(username, client_fd, client_ip);
-        cout << "server: user '" << username << "' connected from " << client_ip << endl;
-        
-        // Receive messages until client disconnects
-        char buf[256];
-        while ((numbytes = recv(client_fd, buf, sizeof buf - 1, 0)) > 0) {
-            buf[numbytes - 1] = '\0'; // Remove newline
-            parseMessage(buf, client_fd, username);
-        }
-        
-        if (numbytes == 0) {
-            cout << "server: user '" << username << "' disconnected" << endl;
-        } else {
-            perror("recv");
-        }
-        
-        // Remove client from list
-        clientList.remove(client_fd);
-        close(client_fd);
-        exit(0);
-    }
-
-void handleConnectionRequest(string message, string &response, const string username) {
-    string peerUsername = message.substr(9);
-    char* peerIP = clientList.findUserIP(peerUsername);
-    if (peerIP == nullptr) {
-        response = "User " + peerUsername + " not found or not online.\n";
-        return;
-    }
-    int peerSockFD = clientList.findUserSockFD(peerUsername);
-    string connectionRequest = username + " wants to connect to you. Accept? (/accept " + username + " or /decline " + username + ")\n";
-    
-    cout << "Sending connection request to " << peerUsername << " at " << string(peerIP) << " sockfd " << peerSockFD << endl;
-    cout << "Message: '" << connectionRequest << "'" << endl;
-    
-    ssize_t bytes_sent = send(peerSockFD, connectionRequest.c_str(), connectionRequest.length(), 0);
-    if (bytes_sent == -1) {
-        perror("send connection request");
-        response = "Failed to send connection request.\n";
-    }
-    else {
-        cout << "Successfully sent " << bytes_sent << " bytes to peer" << endl;
-        response = "Located " + peerUsername + " @" + string(peerIP) + " - waiting for peer to accept connection... \n";
-    }
-}
-
-void parseMessage(const string &message, int client_fd, const string &username) {
+    void parseMessage(const string &message, int client_fd, const string &username) {
         string response = "";
         if (message == "/list") {
             response = clientList.getList();
@@ -206,9 +139,8 @@ void parseMessage(const string &message, int client_fd, const string &username) 
                 handleConnectionRequest(message, response, username);
             }
         }
-        else if (message.substr(0,7) == "/accept") { // Should check whether there is a pending request, otherwise don't allow users to accept
-            // We are in the requested POV
-            if (message.length() <= 9) {
+        else if (message.substr(0,7) == "/accept") {
+            if (message.length() <= 8) {
                 response = "Usage: /accept <username>\n";
             } 
             else {
@@ -217,21 +149,19 @@ void parseMessage(const string &message, int client_fd, const string &username) 
                 int peerSockFD = clientList.findUserSockFD(peerUsername);
                 if (peerIP == nullptr) {
                     response = "User " + peerUsername + " not found or not online.\n";
-                    return;
                 }
                 else {
-                    response = "/makeconnection " + string(peerIP) + "\n"; // to the requested
+                    response = "/makeconnection " + string(peerIP) + "\n";
 
                     string acceptMessage = "/acceptconnection";
-                    if (send(peerSockFD, acceptMessage.c_str(), acceptMessage.length(), 0) == -1) { // to the requestor
+                    if (send(peerSockFD, acceptMessage.c_str(), acceptMessage.length(), 0) == -1) {
                         perror("send accept");
                     }
                 }
-
             }
         }
         else if (message.substr(0,8) == "/decline") {
-            if (message.length() <= 10) {
+            if (message.length() <= 9) {
                 response = "Usage: /decline <username>\n";
             } 
             else {
@@ -240,14 +170,15 @@ void parseMessage(const string &message, int client_fd, const string &username) 
                 int peerSockFD = clientList.findUserSockFD(peerUsername);
                 if (peerIP == nullptr) {
                     response = "User " + peerUsername + " not found or not online.\n";
-                    return;
-                }
-                string declineMessage = "/declined";
-                if (send(peerSockFD, declineMessage.c_str(), declineMessage.length(), 0) == -1) {
-                    perror("send decline");
                 }
                 else {
-                    response = "Declined connection request from " + peerUsername + "\n";
+                    string declineMessage = "/declined";
+                    if (send(peerSockFD, declineMessage.c_str(), declineMessage.length(), 0) == -1) {
+                        perror("send decline");
+                    }
+                    else {
+                        response = "Declined connection request from " + peerUsername + "\n";
+                    }
                 }
             }
         }
@@ -260,11 +191,112 @@ void parseMessage(const string &message, int client_fd, const string &username) 
         }
     }
 
+    void handleNewConnection() {
+        struct sockaddr_storage their_addr;
+        socklen_t sin_size = sizeof their_addr;
+
+        int new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
+        if (new_fd == -1) {
+            perror("accept");
+            return;
+        }
+
+        char s[INET6_ADDRSTRLEN];
+        inet_ntop(their_addr.ss_family,
+                  get_in_addr((struct sockaddr *)&their_addr),
+                  s, sizeof s);
+        cout << "server: got connection from " << s << " on fd=" << new_fd << endl;
+
+        // Add to poll array
+        if (nfds < MAX_CLIENTS) {
+            fds[nfds].fd = new_fd;
+            fds[nfds].events = POLLIN; // Watch for incoming data
+            nfds++;
+
+            // Initialize client info
+            clients[new_fd] = {
+                .username = "",
+                .ip = string(s),
+                .buffer = "",
+                .authenticated = false
+            };
+        } else {
+            cerr << "Too many clients, rejecting connection" << endl;
+            close(new_fd);
+        }
+    }
+
+    void handleClientData(int i) {
+        int client_fd = fds[i].fd;
+        char buf[256];
+        
+        int numbytes = recv(client_fd, buf, sizeof buf - 1, 0);
+        
+        if (numbytes <= 0) {
+            // Connection closed or error
+            if (numbytes == 0) {
+                cout << "server: socket " << client_fd << " hung up" << endl;
+            } else {
+                perror("recv");
+            }
+            
+            // Remove from ClientList if authenticated
+            if (clients[client_fd].authenticated) {
+                cout << "server: user '" << clients[client_fd].username << "' disconnected" << endl;
+                clientList.remove(client_fd);
+            }
+            
+            // Clean up
+            close(client_fd);
+            clients.erase(client_fd);
+            
+            // Remove from poll array (swap with last element)
+            fds[i] = fds[nfds - 1];
+            nfds--;
+            
+            return;
+        }
+        
+        buf[numbytes] = '\0';
+        
+        // If not authenticated, first message is username
+        if (!clients[client_fd].authenticated) {
+            clients[client_fd].username = string(buf);
+            clients[client_fd].authenticated = true;
+            
+            clientList.add(clients[client_fd].username, client_fd, clients[client_fd].ip);
+            cout << "server: user '" << clients[client_fd].username 
+                 << "' connected on fd=" << client_fd << endl;
+            return;
+        }
+        
+        // Add to buffer
+        clients[client_fd].buffer += string(buf);
+        
+        // Process complete messages (ending with \n)
+        size_t pos;
+        while ((pos = clients[client_fd].buffer.find('\n')) != string::npos) {
+            string message = clients[client_fd].buffer.substr(0, pos);
+            clients[client_fd].buffer.erase(0, pos + 1);
+            
+            if (!message.empty()) {
+                cout << "server: received '" << message << "' from " 
+                     << clients[client_fd].username << endl;
+                parseMessage(message, client_fd, clients[client_fd].username);
+            }
+        }
+    }
+
 public:
-    Server(ClientList &list) : clientList(list)
+    Server(ClientList &list) : clientList(list), nfds(0)
     {
-        setupSignalHandler();
         sockfd = createSocket();
+        
+        // Add listening socket to poll array
+        fds[0].fd = sockfd;
+        fds[0].events = POLLIN; // Watch for incoming connections
+        nfds = 1;
+        
         cout << "server: waiting for connections on port " << PORT << "..." << endl;
     }
 
@@ -272,27 +304,26 @@ public:
     {
         while (true)
         {
-            struct sockaddr_storage their_addr;
-            socklen_t sin_size = sizeof their_addr;
-
-            int new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-            if (new_fd == -1)
-            {
-                perror("accept");
-                continue;
+            // Wait for activity on any socket
+            int poll_count = poll(fds, nfds, -1); // -1 = wait indefinitely
+            
+            if (poll_count == -1) {
+                perror("poll");
+                exit(1);
             }
-
-            char s[INET6_ADDRSTRLEN];
-            inet_ntop(their_addr.ss_family,
-                      get_in_addr((struct sockaddr *)&their_addr),
-                      s, sizeof s);
-            cout << "server: got connection from " << s << endl;
-
-            if (!fork())
-            {
-                handleClient(new_fd, string(s));
+            
+            // Check which sockets have activity
+            for (int i = 0; i < nfds; i++) {
+                if (fds[i].revents & POLLIN) {
+                    if (fds[i].fd == sockfd) {
+                        // Activity on listening socket = new connection
+                        handleNewConnection();
+                    } else {
+                        // Activity on client socket = data to read
+                        handleClientData(i);
+                    }
+                }
             }
-            close(new_fd); // parent doesn't need this
         }
     }
 
