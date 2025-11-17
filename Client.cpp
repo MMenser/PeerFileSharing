@@ -20,9 +20,13 @@ int peerSockFD = -1;
 vector<string> fileQueue;
 
 // File receiving state
-enum ReceiveState { TEXT_MODE, RECEIVING_FILE };
+enum ReceiveState
+{
+    TEXT_MODE,
+    RECEIVING_FILE
+};
 ReceiveState recvState = TEXT_MODE;
-FILE* receivingFile = nullptr;
+FILE *receivingFile = nullptr;
 size_t expectedFileSize = 0;
 size_t receivedFileSize = 0;
 string receivingFileName = "";
@@ -210,14 +214,7 @@ void handleServerMessage(const string &message)
         peerSockFD = connectToSocket(peerIP.c_str(), "4000");
         if (peerSockFD != -1)
         {
-            if (send(peerSockFD, "hello", 5, 0) == -1)
-            {
-                perror("send to peer");
-            }
-            else
-            {
-                cout << "Connected to peer!" << endl;
-            }
+            cout << "Connected to peer!" << endl;
         }
         else
         {
@@ -247,11 +244,10 @@ void handleServerMessage(const string &message)
     }
 }
 
-void sendFile(const string& filePath)
+void sendFile(const string &filePath)
 {
-    FILE* file = fopen(filePath.c_str(), "rb");
-    if (!file)
-    {
+    FILE *file = fopen(filePath.c_str(), "rb");
+    if (!file) {
         cerr << "Error: Could not open file " << filePath << endl;
         string errorMsg = "ERROR File not found\n";
         send(peerSockFD, errorMsg.c_str(), errorMsg.length(), 0);
@@ -315,7 +311,7 @@ void handlePeerMessage(const string &message)
         // Parse: FILE filename size\n
         size_t firstSpace = message.find(' ');
         size_t secondSpace = message.find(' ', firstSpace + 1);
-        
+
         if (firstSpace == string::npos || secondSpace == string::npos)
         {
             cerr << "Invalid FILE header" << endl;
@@ -327,12 +323,11 @@ void handlePeerMessage(const string &message)
         expectedFileSize = stoul(sizeStr);
         receivedFileSize = 0;
 
-        // Create downloads directory if it doesn't exist
         mkdir("downloads", 0755);
 
         string savePath = "downloads/" + receivingFileName;
         receivingFile = fopen(savePath.c_str(), "wb");
-        
+
         if (!receivingFile)
         {
             perror("fopen for receiving file");
@@ -356,7 +351,7 @@ void handlePeerMessage(const string &message)
         }
 
         bool found = false;
-        for (const string& queuedFile : fileQueue)
+        for (const string &queuedFile : fileQueue)
         {
             if (queuedFile == filePath)
             {
@@ -376,10 +371,18 @@ void handlePeerMessage(const string &message)
     else if (message.substr(0, 6) == "/files")
     {
         string response = "";
-        for (const string& filePath : fileQueue)
+        if (fileQueue.empty())
         {
-            response += filePath + "\t";
+            response = "No files uploaded.\n";
         }
+        else
+        {
+            for (const string &filePath : fileQueue)
+            {
+                response += filePath + "\t";
+            }
+        }
+
         response += "\n";
 
         if (send(peerSockFD, response.c_str(), response.length(), 0) == -1)
@@ -428,16 +431,16 @@ void handleInput()
         else if (line.substr(0, 7) == "/upload")
         {
             string filePath = line.substr(8);
-            
+
             // Check if file exists
-            FILE* testFile = fopen(filePath.c_str(), "rb");
+            FILE *testFile = fopen(filePath.c_str(), "rb");
             if (!testFile)
             {
                 cout << "\x1b[31mError: File not found: " << filePath << "\x1b[0m" << endl;
                 continue;
             }
             fclose(testFile);
-            
+
             cout << "\x1b[34;47mQueued file for upload: " << filePath << "\x1b[0m" << endl;
             fileQueue.push_back(filePath);
             continue;
@@ -585,7 +588,7 @@ void runClient(const string &username)
                     }
                     close(peerSockFD);
                     peerSockFD = -1;
-                    
+
                     // Clean up file receiving state if interrupted
                     if (receivingFile)
                     {
@@ -609,9 +612,8 @@ void runClient(const string &username)
                         fclose(receivingFile);
                         receivingFile = nullptr;
                         recvState = TEXT_MODE;
-                        
-                        cout << "\x1b[36mFile received successfully: downloads/" << receivingFileName 
-                             << " (" << receivedFileSize << " bytes)\x1b[0m" << endl;
+
+                        cout << "\x1b[36mFile received successfully: downloads/" << receivingFileName << " (" << receivedFileSize << " bytes)\x1b[0m" << endl;
 
                         // If there's leftover data, add it to text buffer
                         if (toWrite < (size_t)numbytes)
