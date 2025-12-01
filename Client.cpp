@@ -11,7 +11,7 @@
 #include <poll.h>
 #include <vector>
 #include <sys/stat.h>
-
+#include "SSLHelper.cpp"
 using namespace std;
 
 int listeningSockFD = -1;
@@ -30,6 +30,7 @@ FILE *receivingFile = nullptr;
 size_t expectedFileSize = 0;
 size_t receivedFileSize = 0;
 string receivingFileName = "";
+SSL *peerSSL = nullptr;
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -161,7 +162,7 @@ void closeServerConnection()
     }
 }
 
-void acceptPeerConnection()
+void acceptPeerConnection(SSLHelper &ssl)
 {
     if (listeningSockFD == -1)
     {
@@ -186,7 +187,17 @@ void acceptPeerConnection()
               get_in_addr((struct sockaddr *)&their_addr),
               s, sizeof s);
 
-    cout << "Peer connected from " << s << endl;
+    peerSSL = ssl.tls_server_handshake(peerSockFD);
+    if (!peerSSL)
+    {
+        cerr << "TLS server handshake failed." << endl;
+        close(peerSockFD);
+        peerSockFD = -1;
+        return;
+    }
+
+    cout << "Peer connected and TLS handshake successful from " << s << endl;
+
 
     close(listeningSockFD);
     listeningSockFD = -1;
@@ -194,7 +205,7 @@ void acceptPeerConnection()
     closeServerConnection();
 }
 
-void handleServerMessage(const string &message)
+void handleServerMessage(const string &message, SSLHelper &ssl)
 {
     if (message.find("wants to connect to you") != string::npos)
     {
@@ -214,7 +225,16 @@ void handleServerMessage(const string &message)
         peerSockFD = connectToSocket(peerIP.c_str(), "4000");
         if (peerSockFD != -1)
         {
-            cout << "Connected to peer!" << endl;
+            // Perform TLS Client Handshake
+            SSL *peerSSL = ssl.tls_client_handshake(peerSockFD);
+            if (!peerSSL)
+            {
+                cerr << "TLS client handshake failed." << endl;
+                close(peerSockFD);
+                peerSockFD = -1;
+                return;
+            }
+            cout << "Connected to peer and TLS handshake successful!" << endl;
         }
         else
         {
@@ -244,13 +264,13 @@ void handleServerMessage(const string &message)
     }
 }
 
-void sendFile(const string &filePath)
+void sendFile(const string &filePath, SSLHelper &ssl)
 {
     FILE *file = fopen(filePath.c_str(), "rb");
     if (!file) {
         cerr << "Error: Could not open file " << filePath << endl;
         string errorMsg = "ERROR File not found\n";
-        send(peerSockFD, errorMsg.c_str(), errorMsg.length(), 0);
+        ssl.ssl_send(errorMsg.c_str(), errorMsg.length(), peerSockFD);
         return;
     }
 
@@ -269,7 +289,7 @@ void sendFile(const string &filePath)
 
     // Send file header: FILE filename size\n
     string header = "FILE " + filename + " " + to_string(fileSize) + "\n";
-    if (send(peerSockFD, header.c_str(), header.length(), 0) == -1)
+    if (ssl.ssl_send(header.c_str(), header.length(), peerSockFD) == -1)
     {
         perror("send header");
         fclose(file);
@@ -288,7 +308,7 @@ void sendFile(const string &filePath)
         size_t bytesSent = 0;
         while (bytesSent < bytesRead)
         {
-            ssize_t n = send(peerSockFD, buffer + bytesSent, bytesRead - bytesSent, 0);
+            ssize_t n = ssl.ssl_send(buffer + bytesSent, bytesRead - bytesSent, peerSockFD);
             if (n == -1)
             {
                 perror("send file data");
@@ -304,13 +324,14 @@ void sendFile(const string &filePath)
     cout << "\x1b[33mFile sent successfully: " << totalSent << " bytes\x1b[0m" << endl;
 }
 
-void handlePeerMessage(const string &message)
+void handlePeerMessage(const string &message, SSLHelper &ssl, const string &username)
 {
     if (message.substr(0, 4) == "FILE")
     {
         // Parse: FILE filename size\n
         size_t firstSpace = message.find(' ');
         size_t secondSpace = message.find(' ', firstSpace + 1);
+        mkdir((username + "/downloads").c_str(), 0755); // Ensure downloads directory exists
 
         if (firstSpace == string::npos || secondSpace == string::npos)
         {
@@ -322,10 +343,8 @@ void handlePeerMessage(const string &message)
         string sizeStr = message.substr(secondSpace + 1);
         expectedFileSize = stoul(sizeStr);
         receivedFileSize = 0;
-
-        mkdir("downloads", 0755);
-
-        string savePath = "downloads/" + receivingFileName;
+        
+        string savePath = username + "/downloads/" + receivingFileName;
         receivingFile = fopen(savePath.c_str(), "wb");
 
         if (!receivingFile)
@@ -355,7 +374,7 @@ void handlePeerMessage(const string &message)
         {
             if (queuedFile == filePath)
             {
-                sendFile(filePath);
+                sendFile(filePath, ssl);
                 found = true;
                 break;
             }
@@ -365,7 +384,7 @@ void handlePeerMessage(const string &message)
         {
             cout << "\x1b[31mRequested file not in upload queue: " << filePath << "\x1b[0m" << endl;
             string errorMsg = "ERROR File not in queue\n";
-            send(peerSockFD, errorMsg.c_str(), errorMsg.length(), 0);
+            ssl.ssl_send(errorMsg.c_str(), errorMsg.length(), peerSockFD);
         }
     }
     else if (message.substr(0, 6) == "/files")
@@ -385,7 +404,7 @@ void handlePeerMessage(const string &message)
 
         response += "\n";
 
-        if (send(peerSockFD, response.c_str(), response.length(), 0) == -1)
+        if (ssl.ssl_send(response.c_str(), response.length(), peerSockFD) == -1)
         {
             perror("send to peer");
         }
@@ -396,7 +415,7 @@ void handlePeerMessage(const string &message)
     }
 }
 
-void handleInput()
+void handleInput(SSLHelper &ssl)
 {
     string stdinBuffer = "";
     char buf[256];
@@ -449,7 +468,7 @@ void handleInput()
         line += "\n";
         if (peerSockFD != -1)
         {
-            if (send(peerSockFD, line.c_str(), line.length(), 0) == -1)
+            if (ssl.ssl_send(line.c_str(), line.length(), peerSockFD) == -1)
             {
                 perror("send to peer");
                 close(peerSockFD);
@@ -484,6 +503,24 @@ void runClient(const string &username)
     if (send(serverSockFD, username.c_str(), username.length(), 0) == -1)
     {
         perror("send username");
+        return;
+    }
+
+    SSLHelper ssl(username);
+    ssl.init_openssl();
+    SSL_CTX *ssl_context = ssl.create_context();
+    if (!ssl_context)
+    {
+        cerr << "Failed to create SSL context. Exiting." << endl;
+        return;
+    }
+
+    // The keys were generated in the constructor as username/server.key and username/server.crt.
+    string key_path = username + "/server.key";
+    string cert_path = username + "/server.crt";
+    if (!ssl.load_certificates(ssl_context, cert_path.c_str(), key_path.c_str(), nullptr)) 
+    {
+        cerr << "Failed to load certificates. Exiting." << endl;
         return;
     }
 
@@ -539,7 +576,7 @@ void runClient(const string &username)
 
             if (fds[i].fd == STDIN_FILENO)
             {
-                handleInput();
+                handleInput(ssl);
             }
             else if (fds[i].fd == serverSockFD)
             {
@@ -564,17 +601,17 @@ void runClient(const string &username)
                 buf[numbytes] = '\0';
                 serverBuffer += string(buf);
 
-                handleServerMessage(serverBuffer);
+                handleServerMessage(serverBuffer, ssl);
                 serverBuffer = "";
             }
             else if (fds[i].fd == listeningSockFD)
             {
-                acceptPeerConnection();
+                acceptPeerConnection(ssl);
             }
             else if (fds[i].fd == peerSockFD)
             {
                 char buf[4096];
-                int numbytes = recv(peerSockFD, buf, sizeof buf, 0);
+                int numbytes = ssl.ssl_recv(buf, sizeof buf, peerSockFD);
 
                 if (numbytes <= 0)
                 {
@@ -596,6 +633,11 @@ void runClient(const string &username)
                         receivingFile = nullptr;
                         recvState = TEXT_MODE;
                     }
+
+                    if(peerSSL) {
+                        SSL_free(peerSSL);
+                        peerSSL = nullptr;
+                    }
                     continue;
                 }
 
@@ -613,7 +655,7 @@ void runClient(const string &username)
                         receivingFile = nullptr;
                         recvState = TEXT_MODE;
 
-                        cout << "\x1b[36mFile received successfully: downloads/" << receivingFileName << " (" << receivedFileSize << " bytes)\x1b[0m" << endl;
+                        cout << "\x1b[36mFile received successfully: " + username + "downloads/" << receivingFileName << " (" << receivedFileSize << " bytes)\x1b[0m" << endl;
 
                         // If there's leftover data, add it to text buffer
                         if (toWrite < (size_t)numbytes)
@@ -635,7 +677,7 @@ void runClient(const string &username)
 
                         if (!message.empty())
                         {
-                            handlePeerMessage(message + "\n");
+                            handlePeerMessage(message + "\n", ssl, username);
                         }
                     }
                 }
