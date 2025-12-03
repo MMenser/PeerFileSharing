@@ -111,7 +111,7 @@ private:
             return;
         }
         int peerSockFD = clientList.findUserSockFD(peerUsername);
-        string connectionRequest = username + " wants to connect to you. Accept? (/accept " + username + " or /decline " + username + ")\n";
+        string connectionRequest = "\x1b[36m" + username + " wants to connect to you. Accept? (/accept " + username + " or /decline " + username + ")\x1b[0m\n";
         
         cout << "Sending connection request to " << peerUsername << " at " << string(peerIP) << " sockfd " << peerSockFD << endl;
         
@@ -121,11 +121,11 @@ private:
             response = "Failed to send connection request.\n";
         }
         else {
-            response = "Located " + peerUsername + " @" + string(peerIP) + " - waiting for peer to accept connection... \n";
+            response = "\x1b[36mLocated " + peerUsername + " @" + string(peerIP) + " - waiting for peer to accept connection... \n" + "\x1b[0m";
         }
     }
 
-    void parseMessage(const string &message, int client_fd, const string &username) {
+    void parseMessage(string &message, int client_fd, const string &username) {
         string response = "";
         if (message == "/list") {
             response = clientList.getList();

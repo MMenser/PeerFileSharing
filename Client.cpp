@@ -11,8 +11,11 @@
 #include <poll.h>
 #include <vector>
 #include <sys/stat.h>
+#include <chrono>
+#include <iomanip>
 #include "SSLHelper.cpp"
 using namespace std;
+using namespace std::chrono;
 
 int listeningSockFD = -1;
 int serverSockFD = -1;
@@ -31,6 +34,68 @@ size_t expectedFileSize = 0;
 size_t receivedFileSize = 0;
 string receivingFileName = "";
 SSL *peerSSL = nullptr;
+
+// Transfer metrics
+steady_clock::time_point transferStartTime;
+steady_clock::time_point lastProgressUpdate;
+
+// Helper function to format bytes
+string formatBytes(size_t bytes)
+{
+    const char* units[] = {"B", "KB", "MB", "GB"};
+    int unitIndex = 0;
+    double size = bytes;
+    
+    while (size >= 1024 && unitIndex < 3)
+    {
+        size /= 1024;
+        unitIndex++;
+    }
+    
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.2f %s", size, units[unitIndex]);
+    return string(buffer);
+}
+
+// Helper function to format speed
+string formatSpeed(double bytesPerSec)
+{
+    return formatBytes((size_t)bytesPerSec) + "/s";
+}
+
+// Helper function to format time
+string formatTime(int seconds)
+{
+    if (seconds < 60)
+        return to_string(seconds) + "s";
+    else if (seconds < 3600)
+        return to_string(seconds / 60) + "m " + to_string(seconds % 60) + "s";
+    else
+        return to_string(seconds / 3600) + "h " + to_string((seconds % 3600) / 60) + "m";
+}
+
+// Draw progress bar
+void drawProgressBar(size_t current, size_t total, double speed)
+{
+    int barWidth = 40;
+    float progress = (float)current / total;
+    int pos = barWidth * progress;
+    
+    double elapsedSec = duration_cast<milliseconds>(steady_clock::now() - transferStartTime).count() / 1000.0;
+    int etaSeconds = (speed > 0) ? (int)((total - current) / speed) : 0;
+    
+    cout << "\r\x1b[36m[";
+    for (int i = 0; i < barWidth; i++)
+    {
+        if (i < pos) cout << "=";
+        else if (i == pos) cout << ">";
+        else cout << " ";
+    }
+    cout << "] " << fixed << setprecision(1) << (progress * 100.0) << "% "
+         << "(" << formatBytes(current) << "/" << formatBytes(total) << ") "
+         << formatSpeed(speed) << " ETA: " << formatTime(etaSeconds)
+         << "\x1b[0m" << flush;
+}
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -100,7 +165,7 @@ int createListeningSocket(string port)
         return -1;
     }
 
-    cout << "Peer listening on port " << port << endl;
+    cout << "\x1b[36m" << "Peer listening on port " << port << "\x1b[0m" << endl;
     return sockfd;
 }
 
@@ -147,7 +212,6 @@ int connectToSocket(const char *ip, string port = "3490")
     }
 
     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
-    cout << "client: connected to " << s << endl;
     freeaddrinfo(servinfo);
 
     return sockfd;
@@ -173,7 +237,7 @@ void acceptPeerConnection(SSLHelper &ssl)
     struct sockaddr_storage their_addr;
     socklen_t sin_size = sizeof their_addr;
 
-    cout << "Waiting for peer to connect..." << endl;
+    cout << "\x1b[36m" << "Waiting for peer to connect..." << "\x1b[0m" << endl;
     peerSockFD = accept(listeningSockFD, (struct sockaddr *)&their_addr, &sin_size);
 
     if (peerSockFD == -1)
@@ -196,8 +260,7 @@ void acceptPeerConnection(SSLHelper &ssl)
         return;
     }
 
-    cout << "Peer connected and TLS handshake successful from " << s << endl;
-
+    cout << "\x1b[36m" << "Peer connected and TLS handshake successful from " << s << "\x1b[0m" << endl;
 
     close(listeningSockFD);
     listeningSockFD = -1;
@@ -219,13 +282,12 @@ void handleServerMessage(const string &message, SSLHelper &ssl)
             peerIP.pop_back();
         }
 
-        cout << "Connecting to peer at " << peerIP << endl;
+        cout << "\x1b[36m" << "Connecting to peer at " << peerIP << "\x1b[0m" << endl;
         closeServerConnection();
 
         peerSockFD = connectToSocket(peerIP.c_str(), "4000");
         if (peerSockFD != -1)
         {
-            // Perform TLS Client Handshake
             SSL *peerSSL = ssl.tls_client_handshake(peerSockFD);
             if (!peerSSL)
             {
@@ -234,7 +296,7 @@ void handleServerMessage(const string &message, SSLHelper &ssl)
                 peerSockFD = -1;
                 return;
             }
-            cout << "Connected to peer and TLS handshake successful!" << endl;
+            cout << "\x1b[36m" << "Connected to peer and TLS handshake successful!" << "\x1b[0m" << endl;
         }
         else
         {
@@ -243,7 +305,7 @@ void handleServerMessage(const string &message, SSLHelper &ssl)
     }
     else if (message.find("/acceptconnection") != string::npos)
     {
-        cout << "Peer accepted! ";
+        cout << "\x1b[36m" << "Peer accepted!" << "\x1b[0m" << endl;
     }
     else if (message == "/declined" || message == "/declined\n")
     {
@@ -260,7 +322,7 @@ void handleServerMessage(const string &message, SSLHelper &ssl)
     }
     else
     {
-        cout << "Server: " << message << flush;
+        cout << "Server: " << message << endl;
     }
 }
 
@@ -274,12 +336,10 @@ void sendFile(const string &filePath, SSLHelper &ssl)
         return;
     }
 
-    // Get file size
     fseek(file, 0, SEEK_END);
     long fileSize = ftell(file);
     rewind(file);
 
-    // Extract just the filename (not full path)
     string filename = filePath;
     size_t lastSlash = filePath.find_last_of("/\\");
     if (lastSlash != string::npos)
@@ -287,7 +347,6 @@ void sendFile(const string &filePath, SSLHelper &ssl)
         filename = filePath.substr(lastSlash + 1);
     }
 
-    // Send file header: FILE filename size\n
     string header = "FILE " + filename + " " + to_string(fileSize) + "\n";
     if (ssl.ssl_send(header.c_str(), header.length(), peerSockFD) == -1)
     {
@@ -296,9 +355,12 @@ void sendFile(const string &filePath, SSLHelper &ssl)
         return;
     }
 
-    cout << "\x1b[33mSending file: " << filename << " (" << fileSize << " bytes)\x1b[0m" << endl;
+    cout << "\x1b[33mSending file: " << filename << " (" << formatBytes(fileSize) << ")\x1b[0m" << endl;
 
-    // Send file data in chunks
+    // Start transfer metrics
+    auto startTime = steady_clock::now();
+    auto lastUpdate = startTime;
+    
     char buffer[4096];
     size_t totalSent = 0;
     size_t bytesRead;
@@ -318,20 +380,38 @@ void sendFile(const string &filePath, SSLHelper &ssl)
             bytesSent += n;
         }
         totalSent += bytesRead;
+
+        // Update progress every 100ms
+        auto now = steady_clock::now();
+        auto elapsed = duration_cast<milliseconds>(now - lastUpdate).count();
+        if (elapsed >= 100 || totalSent == (size_t)fileSize)
+        {
+            double elapsedSec = duration_cast<milliseconds>(now - startTime).count() / 1000.0;
+            double speed = (elapsedSec > 0) ? (totalSent / elapsedSec) : 0;
+            drawProgressBar(totalSent, fileSize, speed);
+            lastUpdate = now;
+        }
     }
 
+    auto endTime = steady_clock::now();
+    double totalTime = duration_cast<milliseconds>(endTime - startTime).count();
+    double avgSpeed = totalTime > 0 ? totalSent / totalTime : 0;
+
+    cout << endl << "\x1b[33mFile sent successfully!" << endl
+         << "  Size: " << formatBytes(totalSent) << endl
+         << "  Time: " << fixed << setprecision(2) << totalTime << "ms" << endl
+         << "  Avg Speed: " << formatSpeed(avgSpeed) << "\x1b[0m" << endl;
+
     fclose(file);
-    cout << "\x1b[33mFile sent successfully: " << totalSent << " bytes\x1b[0m" << endl;
 }
 
 void handlePeerMessage(const string &message, SSLHelper &ssl, const string &username)
 {
     if (message.substr(0, 4) == "FILE")
     {
-        // Parse: FILE filename size\n
         size_t firstSpace = message.find(' ');
         size_t secondSpace = message.find(' ', firstSpace + 1);
-        mkdir((username + "/downloads").c_str(), 0755); // Ensure downloads directory exists
+        mkdir((username + "/downloads").c_str(), 0755);
 
         if (firstSpace == string::npos || secondSpace == string::npos)
         {
@@ -354,7 +434,10 @@ void handlePeerMessage(const string &message, SSLHelper &ssl, const string &user
         }
 
         recvState = RECEIVING_FILE;
-        cout << "\x1b[36mReceiving file: " << receivingFileName << " (" << expectedFileSize << " bytes)\x1b[0m" << endl;
+        transferStartTime = steady_clock::now();
+        lastProgressUpdate = transferStartTime;
+        
+        cout << "\x1b[36mReceiving file: " << receivingFileName << " (" << formatBytes(expectedFileSize) << ")\x1b[0m" << endl;
     }
     else if (message.substr(0, 5) == "ERROR")
     {
@@ -363,7 +446,6 @@ void handlePeerMessage(const string &message, SSLHelper &ssl, const string &user
     else if (message.substr(0, 9) == "/download")
     {
         string filePath = message.substr(10);
-        // Remove trailing newline if present
         if (!filePath.empty() && filePath.back() == '\n')
         {
             filePath.pop_back();
@@ -451,7 +533,6 @@ void handleInput(SSLHelper &ssl)
         {
             string filePath = line.substr(8);
 
-            // Check if file exists
             FILE *testFile = fopen(filePath.c_str(), "rb");
             if (!testFile)
             {
@@ -515,7 +596,6 @@ void runClient(const string &username)
         return;
     }
 
-    // The keys were generated in the constructor as username/server.key and username/server.crt.
     string key_path = username + "/server.key";
     string cert_path = username + "/server.crt";
     if (!ssl.load_certificates(ssl_context, cert_path.c_str(), key_path.c_str(), nullptr)) 
@@ -607,6 +687,7 @@ void runClient(const string &username)
             else if (fds[i].fd == listeningSockFD)
             {
                 acceptPeerConnection(ssl);
+                break;
             }
             else if (fds[i].fd == peerSockFD)
             {
@@ -626,7 +707,6 @@ void runClient(const string &username)
                     close(peerSockFD);
                     peerSockFD = -1;
 
-                    // Clean up file receiving state if interrupted
                     if (receivingFile)
                     {
                         fclose(receivingFile);
@@ -643,30 +723,46 @@ void runClient(const string &username)
 
                 if (recvState == RECEIVING_FILE)
                 {
-                    // Write binary data to file
                     size_t toWrite = min((size_t)numbytes, expectedFileSize - receivedFileSize);
                     fwrite(buf, 1, toWrite, receivingFile);
                     receivedFileSize += toWrite;
 
-                    // Check if file is complete
+                    // Update progress every 100ms
+                    auto now = steady_clock::now();
+                    auto elapsed = duration_cast<milliseconds>(now - lastProgressUpdate).count();
+                    if (elapsed >= 100 || receivedFileSize >= expectedFileSize)
+                    {
+                        double elapsedSec = duration_cast<milliseconds>(now - transferStartTime).count() / 1000.0;
+                        double speed = (elapsedSec > 0) ? (receivedFileSize / elapsedSec) : 0;
+                        drawProgressBar(receivedFileSize, expectedFileSize, speed);
+                        lastProgressUpdate = now;
+                    }
+
                     if (receivedFileSize >= expectedFileSize)
                     {
                         fclose(receivingFile);
                         receivingFile = nullptr;
                         recvState = TEXT_MODE;
 
-                        cout << "\x1b[36mFile received successfully: " + username + "downloads/" << receivingFileName << " (" << receivedFileSize << " bytes)\x1b[0m" << endl;
+                        auto endTime = steady_clock::now();
+                        double totalTime = duration_cast<milliseconds>(endTime - transferStartTime).count();
+                        double avgSpeed = totalTime > 0 ? receivedFileSize / totalTime : 0;
 
-                        // If there's leftover data, add it to text buffer
+                        cout << endl << "\x1b[36m File received successfully!" << endl
+                             << "  Saved to: " << username << "/downloads/" << receivingFileName << endl
+                             << "  Size: " << formatBytes(receivedFileSize) << endl
+                             << "  Time: " << fixed << setprecision(2) << totalTime << "ms" << endl
+                             << "  Avg Speed: " << formatSpeed(avgSpeed) << "\x1b[0m" << endl;
+
                         if (toWrite < (size_t)numbytes)
                         {
                             peerBuffer += string(buf + toWrite, numbytes - toWrite);
                         }
                     }
+                    continue;
                 }
                 else
                 {
-                    // Text mode - process line by line
                     peerBuffer += string(buf, numbytes);
 
                     size_t pos;
@@ -705,7 +801,6 @@ int main(int argc, char *argv[])
 
     runClient(username);
 
-    // Cleanup
     if (receivingFile)
         fclose(receivingFile);
     if (serverSockFD != -1)
